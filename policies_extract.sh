@@ -56,14 +56,18 @@ process_compartment() {
         return
     fi
     
-    # Verificar si hay políticas y validar que sea un número
+    # Verificar si la respuesta es JSON válido y obtener el número de políticas
     policy_count=$(echo "$policies" | jq -r '.data | length' 2>/dev/null)
+    
+    # Si policy_count está vacío o es null, establecer a 0
+    if [ -z "$policy_count" ] || [ "$policy_count" = "null" ]; then
+        policy_count=0
+    fi
     
     # Validar que policy_count sea un número entero
     if ! [[ "$policy_count" =~ ^[0-9]+$ ]]; then
-        echo "  Error: No se pudo determinar el número de políticas (valor: '$policy_count')." | tee -a "$OUTPUT_FILE"
-        echo "" | tee -a "$OUTPUT_FILE"
-        return
+        echo "  Error: Respuesta inválida del API de OCI. Asumiendo 0 políticas." | tee -a "$OUTPUT_FILE"
+        policy_count=0
     fi
     
     if [ "$policy_count" -eq 0 ]; then
@@ -125,10 +129,15 @@ process_compartment() {
     
     subcompartment_count=$(echo "$subcompartments" | jq -r '.data | length' 2>/dev/null)
     
+    # Si subcompartment_count está vacío o es null, establecer a 0
+    if [ -z "$subcompartment_count" ] || [ "$subcompartment_count" = "null" ]; then
+        subcompartment_count=0
+    fi
+    
     # Validar que subcompartment_count sea un número entero
     if ! [[ "$subcompartment_count" =~ ^[0-9]+$ ]]; then
-        echo "  Error: No se pudo determinar el número de subcompartments (valor: '$subcompartment_count')." | tee -a "$OUTPUT_FILE"
-        return
+        echo "  Error: Respuesta inválida del API de OCI para subcompartments. Asumiendo 0." | tee -a "$OUTPUT_FILE"
+        subcompartment_count=0
     fi
     
     if [ "$subcompartment_count" -gt 0 ]; then
