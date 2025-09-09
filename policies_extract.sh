@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # Script para extraer políticas de OCI con análisis jerárquico completo
-# Incluye resumen ejecutivo y análisis de permisos por compartment
+# Versión corregida: Primero descubre el árbol, después busca políticas
+# Compatible con bash estándar
 
 # Colores para la salida
 RED='\033[0;31m'
@@ -15,15 +16,24 @@ NC='\033[0m' # No Color
 # Archivos de salida
 MAIN_OUTPUT="oci_policies_complete_$(date +%Y%m%d_%H%M%S).txt"
 SUMMARY_OUTPUT="oci_policies_summary_$(date +%Y%m%d_%H%M%S).txt"
+TEMP_TREE_FILE="/tmp/oci_tree_$$"
 
-# Arrays para almacenar datos para el resumen
-declare -a COMPARTMENT_NAMES
-declare -a COMPARTMENT_POLICY_COUNTS
-declare -a COMPARTMENT_PATHS
+# Variables globales para estadísticas
+TOTAL_COMPARTMENTS=0
+TOTAL_POLICIES=0
+TOTAL_STATEMENTS=0
+COMPARTMENTS_WITH_POLICIES=0
+COMPARTMENTS_WITHOUT_POLICIES=0
 
 # Verificar que OCI CLI esté instalado
 if ! command -v oci &> /dev/null; then
     echo -e "${RED}Error: OCI CLI no está instalado. Por favor, instálelo primero.${NC}"
+    exit 1
+fi
+
+# Verificar que jq esté instalado
+if ! command -v jq &> /dev/null; then
+    echo -e "${RED}Error: jq no está instalado. Por favor, instálelo primero.${NC}"
     exit 1
 fi
 
@@ -41,14 +51,23 @@ if [ -z "$TENANCY_OCID" ]; then
 fi
 
 echo -e "${GREEN}Tenancy OCID:${NC} $TENANCY_OCID"
-echo ""
 
-# Variables globales para estadísticas
-TOTAL_COMPARTMENTS=0
-TOTAL_POLICIES=0
-TOTAL_STATEMENTS=0
-COMPARTMENTS_WITH_POLICIES=0
-COMPARTMENTS_WITHOUT_POLICIES=0
+# Obtener información del tenancy
+echo -e "${YELLOW}Obteniendo información del tenancy...${NC}"
+TENANCY_INFO=$(oci iam tenancy get --tenancy-id "$TENANCY_OCID" --profile "$OCI_PROFILE" 2>/dev/null)
+
+if [ $? -eq 0 ]; then
+    TENANCY_NAME=$(echo "$TENANCY_INFO" | jq -r '.data.name' 2>/dev/null)
+else
+    TENANCY_NAME="Tenancy ($OCI_PROFILE)"
+fi
+
+if [ -z "$TENANCY_NAME" ] || [ "$TENANCY_NAME" = "null" ]; then
+    TENANCY_NAME="Tenancy ($OCI_PROFILE)"
+fi
+
+echo -e "${GREEN}Tenancy:${NC} $TENANCY_NAME"
+echo ""
 
 # Función para crear el banner
 create_banner() {
@@ -69,152 +88,217 @@ create_banner() {
 EOF
 }
 
-# Función principal de procesamiento
-process_compartment_policies() {
+# FASE 1: Descubrir el árbol de compartments de forma recursiva
+discover_compartment_tree() {
     local compartment_id=$1
     local compartment_name=$2
     local level=$3
-    local is_last=$4
-    local prefix="$5"
-    local full_path="$6"
+    local parent_path="$4"
+    
+    echo -e "${CYAN}[FASE 1] Descubriendo: $compartment_name (Nivel $level)${NC}"
+    
+    # Construir path completo
+    local full_path
+    if [ $level -eq 0 ]; then
+        full_path="$compartment_name"
+    else
+        full_path="$parent_path > $compartment_name"
+    fi
+    
+    # Guardar información en archivo temporal
+    echo "$compartment_id|$compartment_name|$level|$full_path" >> "$TEMP_TREE_FILE"
     
     TOTAL_COMPARTMENTS=$((TOTAL_COMPARTMENTS + 1))
     
-    # Crear prefijos para mostrar la jerarquía
-    local line_prefix=""
-    local child_prefix=""
-    
-    if [ $level -eq 0 ]; then
-        line_prefix="[ROOT]"
-        child_prefix="  "
-        full_path="$compartment_name"
-    else
-        if [ "$is_last" = "true" ]; then
-            line_prefix="${prefix}└── "
-            child_prefix="${prefix}    "
-        else
-            line_prefix="${prefix}├── "
-            child_prefix="${prefix}│   "
-        fi
-        full_path="$full_path > $compartment_name"
-    fi
-    
-    # Mostrar compartment header
-    if [ $level -eq 0 ]; then
-        echo -e "${CYAN}$line_prefix $compartment_name${NC}" | tee -a "$MAIN_OUTPUT"
-    else
-        echo -e "${CYAN}$line_prefix$compartment_name${NC}" | tee -a "$MAIN_OUTPUT"
-    fi
-    
-    # Obtener y procesar políticas
-    echo -e "${BLUE}${child_prefix}🔍 Analizando políticas...${NC}" | tee -a "$MAIN_OUTPUT"
-    
-    policies=$(oci iam policy list --compartment-id "$compartment_id" --all --profile "$OCI_PROFILE" 2>/dev/null)
-    
-    if [ $? -ne 0 ]; then
-        echo "${child_prefix}    ❌ Error al obtener políticas" | tee -a "$MAIN_OUTPUT"
-        COMPARTMENTS_WITHOUT_POLICIES=$((COMPARTMENTS_WITHOUT_POLICIES + 1))
-    else
-        policy_count=$(echo "$policies" | jq -r '.data | length' 2>/dev/null)
-        
-        if [ -z "$policy_count" ] || [ "$policy_count" = "null" ]; then
-            policy_count=0
-        fi
-        
-        if ! [[ "$policy_count" =~ ^[0-9]+$ ]]; then
-            policy_count=0
-        fi
-        
-        # Almacenar datos para el resumen
-        COMPARTMENT_NAMES+=("$compartment_name")
-        COMPARTMENT_POLICY_COUNTS+=("$policy_count")
-        COMPARTMENT_PATHS+=("$full_path")
-        
-        if [ "$policy_count" -eq 0 ]; then
-            echo "${child_prefix}    📋 Sin políticas" | tee -a "$MAIN_OUTPUT"
-            COMPARTMENTS_WITHOUT_POLICIES=$((COMPARTMENTS_WITHOUT_POLICIES + 1))
-        else
-            echo "${child_prefix}    📋 $policy_count políticas encontradas" | tee -a "$MAIN_OUTPUT"
-            TOTAL_POLICIES=$((TOTAL_POLICIES + policy_count))
-            COMPARTMENTS_WITH_POLICIES=$((COMPARTMENTS_WITH_POLICIES + 1))
-            
-            # Procesar cada política
-            counter=0
-            while [ $counter -lt $policy_count ]; do
-                policy_id=$(echo "$policies" | jq -r ".data[$counter].id" 2>/dev/null)
-                policy_name=$(echo "$policies" | jq -r ".data[$counter].name" 2>/dev/null)
-                
-                if [ "$policy_id" != "null" ] && [ "$policy_name" != "null" ] && [ -n "$policy_id" ] && [ -n "$policy_name" ]; then
-                    echo "" | tee -a "$MAIN_OUTPUT"
-                    echo "${child_prefix}        🔐 Política: $policy_name" | tee -a "$MAIN_OUTPUT"
-                    echo "${child_prefix}            ID: $policy_id" | tee -a "$MAIN_OUTPUT"
-                    
-                    # Obtener statements
-                    policy_details=$(oci iam policy get --policy-id "$policy_id" --profile "$OCI_PROFILE" 2>/dev/null)
-                    
-                    if [ $? -eq 0 ]; then
-                        statements=$(echo "$policy_details" | jq -r '.data.statements[]' 2>/dev/null)
-                        
-                        echo "${child_prefix}            📝 Statements:" | tee -a "$MAIN_OUTPUT"
-                        if [ -n "$statements" ]; then
-                            local stmt_count=0
-                            echo "$statements" | while read -r statement; do
-                                if [ -n "$statement" ]; then
-                                    echo "${child_prefix}                • $statement" | tee -a "$MAIN_OUTPUT"
-                                    stmt_count=$((stmt_count + 1))
-                                fi
-                            done
-                            # Contar para estadísticas
-                            local total_stmts=$(echo "$statements" | wc -l)
-                            TOTAL_STATEMENTS=$((TOTAL_STATEMENTS + total_stmts))
-                        else
-                            echo "${child_prefix}                • Sin statements válidos" | tee -a "$MAIN_OUTPUT"
-                        fi
-                    else
-                        echo "${child_prefix}            ❌ Error al obtener detalles" | tee -a "$MAIN_OUTPUT"
-                    fi
-                fi
-                
-                counter=$((counter + 1))
-            done
-        fi
-    fi
-    
-    echo "" | tee -a "$MAIN_OUTPUT"
-    
-    # Procesar subcompartments
-    subcompartments=$(oci iam compartment list --compartment-id "$compartment_id" --lifecycle-state ACTIVE --all --profile "$OCI_PROFILE" 2>/dev/null)
+    # Buscar subcompartments
+    echo -e "${BLUE}    └── Buscando subcompartments...${NC}"
+    local subcompartments=$(oci iam compartment list \
+        --compartment-id "$compartment_id" \
+        --lifecycle-state ACTIVE \
+        --all \
+        --profile "$OCI_PROFILE" 2>/dev/null)
     
     if [ $? -eq 0 ]; then
-        subcompartment_count=$(echo "$subcompartments" | jq -r '.data | length' 2>/dev/null)
+        local subcompartment_count=$(echo "$subcompartments" | jq -r '.data | length' 2>/dev/null)
         
         if [ -z "$subcompartment_count" ] || [ "$subcompartment_count" = "null" ]; then
             subcompartment_count=0
         fi
         
-        if ! [[ "$subcompartment_count" =~ ^[0-9]+$ ]]; then
-            subcompartment_count=0
-        fi
+        echo -e "${BLUE}    └── Encontrados: $subcompartment_count subcompartments${NC}"
         
         if [ "$subcompartment_count" -gt 0 ]; then
-            sub_counter=0
+            local sub_counter=0
+            
             while [ $sub_counter -lt $subcompartment_count ]; do
-                sub_id=$(echo "$subcompartments" | jq -r ".data[$sub_counter].id" 2>/dev/null)
-                sub_name=$(echo "$subcompartments" | jq -r ".data[$sub_counter].name" 2>/dev/null)
+                local sub_id=$(echo "$subcompartments" | jq -r ".data[$sub_counter].id" 2>/dev/null)
+                local sub_name=$(echo "$subcompartments" | jq -r ".data[$sub_counter].name" 2>/dev/null)
                 
                 if [ "$sub_id" != "null" ] && [ "$sub_name" != "null" ] && [ -n "$sub_id" ] && [ -n "$sub_name" ]; then
-                    local is_last_sub="false"
-                    if [ $sub_counter -eq $((subcompartment_count - 1)) ]; then
-                        is_last_sub="true"
-                    fi
-                    
-                    process_compartment_policies "$sub_id" "$sub_name" $((level + 1)) "$is_last_sub" "$child_prefix" "$full_path"
+                    # Recursivamente descubrir subcompartments
+                    discover_compartment_tree "$sub_id" "$sub_name" $((level + 1)) "$full_path"
                 fi
                 
                 sub_counter=$((sub_counter + 1))
             done
         fi
+    else
+        echo -e "${RED}    └── Error al obtener subcompartments${NC}"
     fi
+}
+
+# FASE 2: Buscar políticas en cada compartment
+search_all_policies() {
+    echo -e "${YELLOW}[FASE 2] Analizando políticas en todos los compartments...${NC}"
+    
+    while IFS='|' read -r compartment_id compartment_name level full_path; do
+        if [ -n "$compartment_id" ]; then
+            echo -e "${YELLOW}Analizando políticas en: $compartment_name${NC}"
+            
+            # Buscar políticas
+            local policies=$(oci iam policy list \
+                --compartment-id "$compartment_id" \
+                --all \
+                --profile "$OCI_PROFILE" 2>/dev/null)
+            
+            local policy_count=0
+            local statement_count=0
+            
+            if [ $? -eq 0 ]; then
+                policy_count=$(echo "$policies" | jq -r '.data | length' 2>/dev/null)
+                
+                if [ -z "$policy_count" ] || [ "$policy_count" = "null" ]; then
+                    policy_count=0
+                fi
+                
+                echo -e "${GREEN}    └── Políticas encontradas: $policy_count${NC}"
+                
+                if [ "$policy_count" -gt 0 ]; then
+                    COMPARTMENTS_WITH_POLICIES=$((COMPARTMENTS_WITH_POLICIES + 1))
+                    TOTAL_POLICIES=$((TOTAL_POLICIES + policy_count))
+                    
+                    # Contar statements en todas las políticas
+                    local counter=0
+                    while [ $counter -lt $policy_count ]; do
+                        local policy_id=$(echo "$policies" | jq -r ".data[$counter].id" 2>/dev/null)
+                        
+                        if [ "$policy_id" != "null" ] && [ -n "$policy_id" ]; then
+                            local policy_details=$(oci iam policy get \
+                                --policy-id "$policy_id" \
+                                --profile "$OCI_PROFILE" 2>/dev/null)
+                            
+                            if [ $? -eq 0 ]; then
+                                local statements=$(echo "$policy_details" | jq -r '.data.statements | length' 2>/dev/null)
+                                if [ -n "$statements" ] && [ "$statements" != "null" ]; then
+                                    statement_count=$((statement_count + statements))
+                                fi
+                            fi
+                        fi
+                        
+                        counter=$((counter + 1))
+                    done
+                    
+                    TOTAL_STATEMENTS=$((TOTAL_STATEMENTS + statement_count))
+                else
+                    COMPARTMENTS_WITHOUT_POLICIES=$((COMPARTMENTS_WITHOUT_POLICIES + 1))
+                fi
+            else
+                echo -e "${RED}    └── Error al obtener políticas${NC}"
+                COMPARTMENTS_WITHOUT_POLICIES=$((COMPARTMENTS_WITHOUT_POLICIES + 1))
+            fi
+            
+            # Actualizar archivo temporal con estadísticas
+            echo "$compartment_id|$compartment_name|$level|$full_path|$policy_count|$statement_count" >> "${TEMP_TREE_FILE}.stats"
+        fi
+    done < "$TEMP_TREE_FILE"
+}
+
+# FASE 3: Generar reporte detallado con estructura jerárquica
+generate_detailed_report() {
+    echo -e "${CYAN}[FASE 3] Generando reporte detallado...${NC}"
+    
+    # Función interna para mostrar compartment con indentación
+    show_compartment_details() {
+        local compartment_id=$1
+        local compartment_name=$2
+        local level=$3
+        local full_path=$4
+        local policy_count=$5
+        local statement_count=$6
+        
+        # Crear indentación basada en el nivel
+        local indent=""
+        local prefix=""
+        
+        if [ $level -eq 0 ]; then
+            prefix="[ROOT] "
+        else
+            local i=0
+            while [ $i -lt $level ]; do
+                if [ $i -eq $((level - 1)) ]; then
+                    indent="${indent}└── "
+                else
+                    indent="${indent}    "
+                fi
+                i=$((i + 1))
+            done
+            prefix="$indent"
+        fi
+        
+        # Escribir información del compartment
+        echo "${prefix}${compartment_name}" >> "$MAIN_OUTPUT"
+        echo "    ${indent}Path: $full_path" >> "$MAIN_OUTPUT"
+        echo "    ${indent}Políticas: $policy_count | Statements: $statement_count" >> "$MAIN_OUTPUT"
+        
+        # Si hay políticas, mostrar detalles
+        if [ "$policy_count" -gt 0 ]; then
+            local policies=$(oci iam policy list \
+                --compartment-id "$compartment_id" \
+                --all \
+                --profile "$OCI_PROFILE" 2>/dev/null)
+            
+            if [ $? -eq 0 ]; then
+                local counter=0
+                while [ $counter -lt $policy_count ]; do
+                    local policy_id=$(echo "$policies" | jq -r ".data[$counter].id" 2>/dev/null)
+                    local policy_name=$(echo "$policies" | jq -r ".data[$counter].name" 2>/dev/null)
+                    
+                    if [ "$policy_id" != "null" ] && [ "$policy_name" != "null" ] && [ -n "$policy_id" ] && [ -n "$policy_name" ]; then
+                        echo "" >> "$MAIN_OUTPUT"
+                        echo "        ${indent}🔐 Política: $policy_name" >> "$MAIN_OUTPUT"
+                        echo "        ${indent}    ID: $policy_id" >> "$MAIN_OUTPUT"
+                        
+                        # Obtener statements
+                        local policy_details=$(oci iam policy get \
+                            --policy-id "$policy_id" \
+                            --profile "$OCI_PROFILE" 2>/dev/null)
+                        
+                        if [ $? -eq 0 ]; then
+                            echo "        ${indent}    📝 Statements:" >> "$MAIN_OUTPUT"
+                            echo "$policy_details" | jq -r '.data.statements[]' 2>/dev/null | while read -r statement; do
+                                if [ -n "$statement" ]; then
+                                    echo "        ${indent}        • $statement" >> "$MAIN_OUTPUT"
+                                fi
+                            done
+                        else
+                            echo "        ${indent}    ❌ Error al obtener detalles" >> "$MAIN_OUTPUT"
+                        fi
+                    fi
+                    
+                    counter=$((counter + 1))
+                done
+            fi
+        fi
+        
+        echo "" >> "$MAIN_OUTPUT"
+    }
+    
+    # Procesar archivo de estadísticas ordenado por nivel
+    sort -t'|' -k3n "${TEMP_TREE_FILE}.stats" | while IFS='|' read -r compartment_id compartment_name level full_path policy_count statement_count; do
+        if [ -n "$compartment_id" ]; then
+            show_compartment_details "$compartment_id" "$compartment_name" "$level" "$full_path" "$policy_count" "$statement_count"
+        fi
+    done
 }
 
 # Función para generar resumen ejecutivo
@@ -238,26 +322,37 @@ ESTADÍSTICAS GENERALES:
 • Total de Políticas Encontradas: $TOTAL_POLICIES
 • Total de Statements: $TOTAL_STATEMENTS
 
-DISTRIBUCIÓN DE POLÍTICAS:
-=========================
+DISTRIBUCIÓN DE POLÍTICAS POR COMPARTMENT:
+==========================================
 EOF
     
-    # Mostrar distribución por compartment
-    for i in "${!COMPARTMENT_NAMES[@]}"; do
-        local name="${COMPARTMENT_NAMES[$i]}"
-        local count="${COMPARTMENT_POLICY_COUNTS[$i]}"
-        local path="${COMPARTMENT_PATHS[$i]}"
-        
-        printf "%-30s | %-5s políticas | %s\n" "$name" "$count" "$path" >> "$SUMMARY_OUTPUT"
-    done
+    # Mostrar distribución por compartment usando el archivo de estadísticas
+    while IFS='|' read -r compartment_id compartment_name level full_path policy_count statement_count; do
+        if [ -n "$compartment_id" ]; then
+            printf "%-30s | %-5s políticas | %s\n" "$compartment_name" "$policy_count" "$full_path" >> "$SUMMARY_OUTPUT"
+        fi
+    done < "${TEMP_TREE_FILE}.stats"
     
     cat >> "$SUMMARY_OUTPUT" << EOF
 
 ANÁLISIS DE SEGURIDAD:
 =====================
-• Ratio de Compartments con Políticas: $(echo "scale=2; $COMPARTMENTS_WITH_POLICIES * 100 / $TOTAL_COMPARTMENTS" | bc -l)%
-• Promedio de Políticas por Compartment: $(echo "scale=2; $TOTAL_POLICIES / $TOTAL_COMPARTMENTS" | bc -l)
-• Promedio de Statements por Política: $(echo "scale=2; $TOTAL_STATEMENTS / $TOTAL_POLICIES" | bc -l)
+EOF
+    
+    if [ $TOTAL_COMPARTMENTS -gt 0 ]; then
+        local coverage_percentage=$((COMPARTMENTS_WITH_POLICIES * 100 / TOTAL_COMPARTMENTS))
+        echo "• Ratio de Compartments con Políticas: ${coverage_percentage}%" >> "$SUMMARY_OUTPUT"
+        
+        local avg_policies=$((TOTAL_POLICIES * 100 / TOTAL_COMPARTMENTS))
+        echo "• Promedio de Políticas por Compartment: $((avg_policies / 100)).$((avg_policies % 100))" >> "$SUMMARY_OUTPUT"
+    fi
+    
+    if [ $TOTAL_POLICIES -gt 0 ]; then
+        local avg_statements=$((TOTAL_STATEMENTS * 100 / TOTAL_POLICIES))
+        echo "• Promedio de Statements por Política: $((avg_statements / 100)).$((avg_statements % 100))" >> "$SUMMARY_OUTPUT"
+    fi
+    
+    cat >> "$SUMMARY_OUTPUT" << EOF
 
 RECOMENDACIONES:
 ===============
@@ -279,47 +374,66 @@ EOF
 
 ================================================================================
 Archivo de detalle completo: $MAIN_OUTPUT
-Generado por: OCI Policies Hierarchical Analyzer
+Generado por: OCI Policies Hierarchical Analyzer v2.0
 ================================================================================
 EOF
 }
 
+# Función de limpieza
+cleanup() {
+    if [ -f "$TEMP_TREE_FILE" ]; then
+        rm -f "$TEMP_TREE_FILE"
+    fi
+    if [ -f "${TEMP_TREE_FILE}.stats" ]; then
+        rm -f "${TEMP_TREE_FILE}.stats"
+    fi
+}
+
+# Capturar señales para limpieza
+trap cleanup EXIT INT TERM
+
 # ========== EJECUCIÓN PRINCIPAL ==========
 
-# Obtener información del tenancy
-echo -e "${YELLOW}Obteniendo información del tenancy...${NC}"
-TENANCY_INFO=$(oci iam tenancy get --tenancy-id "$TENANCY_OCID" --profile "$OCI_PROFILE" 2>/dev/null)
-
-if [ $? -eq 0 ]; then
-    TENANCY_NAME=$(echo "$TENANCY_INFO" | jq -r '.data.name' 2>/dev/null)
-else
-    TENANCY_NAME="Tenancy ($OCI_PROFILE)"
-fi
-
-if [ -z "$TENANCY_NAME" ] || [ "$TENANCY_NAME" = "null" ]; then
-    TENANCY_NAME="Tenancy ($OCI_PROFILE)"
-fi
-
-echo -e "${GREEN}Tenancy:${NC} $TENANCY_NAME"
+echo "=================================================================================="
+echo -e "${GREEN}🚀 INICIANDO ANÁLISIS JERÁRQUICO DE POLÍTICAS OCI${NC}"
+echo "=================================================================================="
 echo ""
 
-# Crear archivos de salida
+# FASE 1: Descubrir árbol completo de compartments
+echo -e "${CYAN}FASE 1: DESCUBRIMIENTO DEL ÁRBOL DE COMPARTMENTS${NC}"
+echo "=================================================================================="
+discover_compartment_tree "$TENANCY_OCID" "$TENANCY_NAME" 0 ""
+echo ""
+echo -e "${GREEN}✅ Árbol de compartments descubierto: $TOTAL_COMPARTMENTS compartments encontrados${NC}"
+echo ""
+
+# FASE 2: Buscar políticas en cada compartment
+echo -e "${CYAN}FASE 2: BÚSQUEDA DE POLÍTICAS${NC}"
+echo "=================================================================================="
+search_all_policies
+echo ""
+echo -e "${GREEN}✅ Búsqueda de políticas completada${NC}"
+echo ""
+
+# FASE 3: Generar reportes
+echo -e "${CYAN}FASE 3: GENERACIÓN DE REPORTES${NC}"
+echo "=================================================================================="
+
+# Crear archivo de detalle
 create_banner "OCI POLICIES HIERARCHICAL ANALYSIS" "$MAIN_OUTPUT"
+echo "JERARQUÍA DE COMPARTMENTS Y POLÍTICAS:" >> "$MAIN_OUTPUT"
+echo "=======================================" >> "$MAIN_OUTPUT"
+echo "" >> "$MAIN_OUTPUT"
 
-echo "JERARQUÍA DE COMPARTMENTS Y POLÍTICAS:" | tee -a "$MAIN_OUTPUT"
-echo "=======================================" | tee -a "$MAIN_OUTPUT"
-echo "" | tee -a "$MAIN_OUTPUT"
-
-# Procesar desde el root
-echo -e "${YELLOW}Iniciando análisis jerárquico...${NC}"
-process_compartment_policies "$TENANCY_OCID" "$TENANCY_NAME" 0 "true" "" ""
+generate_detailed_report
 
 # Generar resumen ejecutivo
-echo -e "${YELLOW}Generando resumen ejecutivo...${NC}"
 generate_executive_summary
 
-# Mostrar resultados finales
+echo -e "${GREEN}✅ Reportes generados${NC}"
 echo ""
+
+# Mostrar resultados finales
 echo "=================================================================================="
 echo -e "${GREEN}✅ ANÁLISIS COMPLETADO${NC}"
 echo "=================================================================================="
@@ -331,6 +445,7 @@ echo -e "${CYAN}Estadísticas finales:${NC}"
 echo -e "  • Compartments: ${GREEN}$TOTAL_COMPARTMENTS${NC}"
 echo -e "  • Políticas: ${GREEN}$TOTAL_POLICIES${NC}"
 echo -e "  • Statements: ${GREEN}$TOTAL_STATEMENTS${NC}"
+echo -e "  • Cobertura: ${GREEN}$COMPARTMENTS_WITH_POLICIES${NC}/${GREEN}$TOTAL_COMPARTMENTS${NC} compartments con políticas"
 echo ""
 echo -e "${YELLOW}Ver resumen ejecutivo:${NC}"
 echo "=================================================================================="
